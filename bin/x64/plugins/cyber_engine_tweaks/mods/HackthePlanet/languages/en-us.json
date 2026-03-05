@@ -1,0 +1,9 @@
+{
+    "HackthePlanetForReal":"Hack the Planet For Real",
+    "HackthePlanet":"Hack the Planet",
+    "HackthePlanetDesc":"If true, Computers, Vending Machines, Confession Booths, Arcade Machines, Pachinko Machines, and Ice Machines, that are connected to a network and powered, can be hacked.",
+    "Reinitialize":"Reinitialize Access Points",
+    "ReinitializeDesc":"If true, access points will reset themselves to be hacked again.",
+    "EnableDebugLog":"Enable Debug Logging",
+    "EnableDebugLogDesc":"If true, debug messages will appear in scripting.log. Only turn on when diagnosing issues."
+}

@@ -1,0 +1,538 @@
+// ============================================================================
+// BetterNetrunning - RemoteBreach Network Unlock Integration
+// ============================================================================
+// Extends RemoteBreach (CustomHackingSystem) to apply network effects similar
+// to AccessPoint breach. Provides target device unlock + Radial Unlock support.
+//
+// FUNCTIONALITY:
+// - Target device unlock: Immediate unlock of breached device
+// - Network-wide unlock: Propagates unlock to all connected devices (same as AccessPoint breach)
+// - Radial Unlock: Records breach position for standalone device support (50m radius)
+// - NPC duplicate prevention: Tracks directly breached NPCs (m_betterNetrunningWasDirectlyBreached flag on ScriptedPuppetPS)
+// - Loot rewards: Datamine programs provide money/crafting materials/shards
+// - RadialBreach integration: Physical distance filtering (50m default)
+//
+// ARCHITECTURE:
+// - OnRemoteBreachSucceeded callback (RemoteBreachHelpers.reds) handles breach success with statistics
+// - RemoteBreachStateSystem integration for target device retrieval
+// - DeviceTypeUtils for unified device unlock logic
+// - RadialUnlockSystem for position recording
+// - TransactionSystem for loot rewards
+// - RadialBreachGating for physical distance filtering
+// ============================================================================
+
+module BetterNetrunning.RadialUnlock
+import BetterNetrunning.Logging.*
+
+import BetterNetrunning.Core.*
+import BetterNetrunning.Integration.*
+import BetterNetrunning.Utils.*
+import BetterNetrunning.RemoteBreach.Core.*
+import BetterNetrunning.RemoteBreach.Actions.*
+import BetterNetrunningConfig.*
+
+// NOTE: RadialBreach integration is handled by RadialBreachGating.reds
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Radial Unlock statistics result
+// Tracks device counts and unlock success for 50m radius breach operations
+public struct RadialUnlockResult {
+    public let basicCount: Int32;
+    public let cameraCount: Int32;
+    public let turretCount: Int32;
+    public let npcCount: Int32;
+    public let basicUnlocked: Int32;
+    public let cameraUnlocked: Int32;
+    public let turretUnlocked: Int32;
+    public let npcUnlocked: Int32;
+}
+
+// ============================================================================
+// UNCONSCIOUS NPC BREACH PROCESSING
+// ============================================================================
+
+/*
+ * Applies network unlock to devices after Unconscious NPC Breach. Uses
+ * BreachStatisticsCollector for unified statistics collection.
+ *
+ * @param networkDevices Array of network device persistent states
+ * @param unlockFlags Flags indicating which device types to unlock
+ * @param stats BreachSessionStats for statistics collection
+ */
+@addMethod(PlayerPuppet)
+private func ApplyUnconsciousNPCNetworkUnlockWithStats(
+  networkDevices: array<ref<DeviceComponentPS>>,
+  unlockFlags: BreachUnlockFlags,
+  stats: ref<BreachSessionStats>
+) -> Void {
+  // Collect network device statistics using unified collector
+  BreachStatisticsCollector.CollectNetworkDeviceStats(networkDevices, unlockFlags, stats);
+
+  // Apply unlock to all devices
+  let i: Int32 = 0;
+  while i < ArraySize(networkDevices) {
+    let device: ref<DeviceComponentPS> = networkDevices[i];
+    if IsDefined(device) {
+      let TargetType: TargetType = DeviceTypeUtils.GetDeviceType(device);
+
+      // Check if this device type should be unlocked
+      if DeviceTypeUtils.ShouldUnlockByFlags(TargetType, unlockFlags) {
+        let sharedPS: ref<SharedGameplayPS> = device as SharedGameplayPS;
+        if IsDefined(sharedPS) {
+          // Apply device-type-specific unlock timestamp
+          let currentTime: Float = TimeUtils.GetCurrentTimestamp(this.GetGame());
+          TimeUtils.SetDeviceUnlockTimestamp(sharedPS, TargetType, currentTime);
+
+          // DEBUG: Log timestamp application
+          BNTrace("UnconsciousNPCUnlock", "Applied unlock timestamp: " +
+            ToString(currentTime) + " to device type: " +
+            EnumValueToString("TargetType", Cast<Int64>(EnumInt(TargetType))));
+        }
+      }
+    }
+    i += 1;
+  }
+}
+
+// Record unconscious NPC breach position for radial unlock
+@addMethod(PlayerPuppet)
+private func RecordUnconsciousNPCBreachPosition(targetNPC: ref<ScriptedPuppet>) -> Void {
+  if !IsDefined(targetNPC) {
+    return;
+  }
+
+  let position: Vector4 = targetNPC.GetWorldPosition();
+  RecordAccessPointBreachByPosition(position, this.GetGame());
+
+  BNInfo("UnconsciousNPC", "Recorded breach position for radial unlock");
+}
+
+// ============================================================================
+// REMOTEBREACH DETECTION
+// ============================================================================
+
+// Check if current minigame is a RemoteBreach (not AccessPoint or Quickhack)
+@addMethod(PlayerPuppet)
+private func IsRemoteBreachMinigame() -> Bool {
+  let gameInstance: GameInstance = this.GetGame();
+  let container: ref<ScriptableSystemsContainer> = GameInstance.GetScriptableSystemsContainer(gameInstance);
+
+  // Check Computer RemoteBreach
+  let computerSystem: ref<RemoteBreachStateSystem> = container.Get(BNConstants.CLASS_REMOTE_BREACH_STATE_SYSTEM()) as RemoteBreachStateSystem;
+  if IsDefined(computerSystem) {
+    let currentComputer: wref<ComputerControllerPS> = computerSystem.GetCurrentComputer();
+    if IsDefined(currentComputer) {
+      return true;
+    }
+  }
+
+  // Check Device RemoteBreach
+  let deviceSystem: ref<DeviceRemoteBreachStateSystem> = container.Get(BNConstants.CLASS_DEVICE_REMOTE_BREACH_STATE_SYSTEM()) as DeviceRemoteBreachStateSystem;
+  if IsDefined(deviceSystem) {
+    let currentDevice: wref<ScriptableDeviceComponentPS> = deviceSystem.GetCurrentDevice();
+    if IsDefined(currentDevice) {
+      return true;
+    }
+  }
+
+  // Check Vehicle RemoteBreach
+  let vehicleSystem: ref<VehicleRemoteBreachStateSystem> = container.Get(BNConstants.CLASS_VEHICLE_REMOTE_BREACH_STATE_SYSTEM()) as VehicleRemoteBreachStateSystem;
+  if IsDefined(vehicleSystem) {
+    let currentVehicle: wref<VehicleComponentPS> = vehicleSystem.GetCurrentVehicle();
+    if IsDefined(currentVehicle) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Check if current minigame is an Unconscious NPC Breach
+@addMethod(PlayerPuppet)
+private func IsUnconsciousNPCBreachMinigame() -> Bool {
+  let minigameBB: ref<IBlackboard> = GameInstance.GetBlackboardSystem(this.GetGame()).Get(GetAllBlackboardDefs().HackingMinigame);
+
+  if !IsDefined(minigameBB) {
+    return false;
+  }
+
+  // Check if the target entity is an unconscious NPC
+  let entity: wref<Entity> = FromVariant<wref<Entity>>(minigameBB.GetVariant(GetAllBlackboardDefs().HackingMinigame.Entity));
+
+  if !IsDefined(entity) {
+    return false;
+  }
+
+  // Check if entity is a ScriptedPuppet (NPC)
+  let puppet: ref<ScriptedPuppet> = entity as ScriptedPuppet;
+  if !IsDefined(puppet) {
+    return false;
+  }
+
+  // Check if NPC is incapacitated (unconscious)
+  return puppet.IsIncapacitated();
+}
+
+// ============================================================================
+// DEBUG LOGGING (REMOVED - now handled by statistics)
+// ============================================================================
+
+// ============================================================================
+// NETWORK UNLOCK PROCESSING
+// ============================================================================
+
+/*
+ * Applies network unlock to devices after RemoteBreach (with statistics). Uses
+ * BreachStatisticsCollector for unified statistics collection.
+ *
+ * @param targetDevice Target device that was breached
+ * @param networkDevices Array of network device persistent states
+ * @param unlockFlags Flags indicating which device types to unlock
+ * @param stats BreachSessionStats for statistics collection
+ */
+@addMethod(PlayerPuppet)
+private func ApplyRemoteBreachNetworkUnlockWithStats(
+  targetDevice: ref<ScriptableDeviceComponentPS>,
+  networkDevices: array<ref<DeviceComponentPS>>,
+  unlockFlags: BreachUnlockFlags,
+  stats: ref<BreachSessionStats>
+) -> Void {
+  // Collect network device statistics using unified collector
+  BreachStatisticsCollector.CollectNetworkDeviceStats(networkDevices, unlockFlags, stats);
+
+  // Apply unlock to all devices
+  let i: Int32 = 0;
+  while i < ArraySize(networkDevices) {
+    let device: ref<DeviceComponentPS> = networkDevices[i];
+    if IsDefined(device) {
+      let scriptableDevice: ref<ScriptableDeviceComponentPS> = device as ScriptableDeviceComponentPS;
+      if IsDefined(scriptableDevice) {
+        let TargetType: TargetType = DeviceTypeUtils.GetDeviceType(scriptableDevice);
+
+        // Check if this device type should be unlocked
+        if DeviceTypeUtils.ShouldUnlockByFlags(TargetType, unlockFlags) {
+          let sharedPS: ref<SharedGameplayPS> = scriptableDevice;
+          if IsDefined(sharedPS) {
+            // Apply device-type-specific unlock timestamp
+            let currentTime: Float = TimeUtils.GetCurrentTimestamp(this.GetGame());
+            TimeUtils.SetDeviceUnlockTimestamp(sharedPS, TargetType, currentTime);
+          }
+        }
+      }
+    }
+    i += 1;
+  }
+}
+
+// ============================================================================
+// PROGRAM PARSING
+// ============================================================================
+
+// Parse unlock flags from active minigame programs
+@addMethod(PlayerPuppet)
+private func ParseRemoteBreachUnlockFlags(activePrograms: array<TweakDBID>) -> BreachUnlockFlags {
+  let flags: BreachUnlockFlags;
+
+  let i: Int32 = 0;
+  while i < ArraySize(activePrograms) {
+    let programID: TweakDBID = activePrograms[i];
+
+    if Equals(programID, BNConstants.PROGRAM_UNLOCK_QUICKHACKS()) {
+      flags.unlockBasic = true;
+    } else if Equals(programID, BNConstants.PROGRAM_UNLOCK_NPC_QUICKHACKS()) {
+      flags.unlockNPCs = true;
+    } else if Equals(programID, BNConstants.PROGRAM_UNLOCK_CAMERA_QUICKHACKS()) {
+      flags.unlockCameras = true;
+    } else if Equals(programID, BNConstants.PROGRAM_UNLOCK_TURRET_QUICKHACKS()) {
+      flags.unlockTurrets = true;
+    }
+
+    i += 1;
+  }
+
+  return flags;
+}
+
+// ============================================================================
+// TARGET DEVICE RETRIEVAL
+// ============================================================================
+
+// Get RemoteBreach target device from state systems
+@addMethod(PlayerPuppet)
+private func GetRemoteBreachTargetDevice() -> ref<ScriptableDeviceComponentPS> {
+  let gameInstance: GameInstance = this.GetGame();
+  let container: ref<ScriptableSystemsContainer> = GameInstance.GetScriptableSystemsContainer(gameInstance);
+
+  // Try Computer RemoteBreach
+  let computerSystem: ref<RemoteBreachStateSystem> = container.Get(BNConstants.CLASS_REMOTE_BREACH_STATE_SYSTEM()) as RemoteBreachStateSystem;
+  if IsDefined(computerSystem) {
+    let currentComputer: wref<ComputerControllerPS> = computerSystem.GetCurrentComputer();
+    if IsDefined(currentComputer) {
+      return currentComputer;
+    }
+  }
+
+  // Try Device RemoteBreach
+  let deviceSystem: ref<DeviceRemoteBreachStateSystem> = container.Get(BNConstants.CLASS_DEVICE_REMOTE_BREACH_STATE_SYSTEM()) as DeviceRemoteBreachStateSystem;
+  if IsDefined(deviceSystem) {
+    let currentDevice: wref<ScriptableDeviceComponentPS> = deviceSystem.GetCurrentDevice();
+    if IsDefined(currentDevice) {
+      return currentDevice;
+    }
+  }
+
+  // Try Vehicle RemoteBreach
+  let vehicleSystem: ref<VehicleRemoteBreachStateSystem> = container.Get(BNConstants.CLASS_VEHICLE_REMOTE_BREACH_STATE_SYSTEM()) as VehicleRemoteBreachStateSystem;
+  if IsDefined(vehicleSystem) {
+    let currentVehicle: wref<VehicleComponentPS> = vehicleSystem.GetCurrentVehicle();
+    if IsDefined(currentVehicle) {
+      return currentVehicle;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// NETWORK DEVICE RETRIEVAL
+// ============================================================================
+
+/*
+ * Gets all network devices connected to RemoteBreach target device. Uses
+ * GetAccessPoints() + GetChildren() API (same as AccessPoint breach). Shallow
+ * nesting (max 2 levels) using helper methods.
+ *
+ * @param targetDevice Target device that was breached
+ * @return Array of network device persistent states
+ */
+@addMethod(PlayerPuppet)
+private func GetRemoteBreachNetworkDevices(
+  targetDevice: ref<ScriptableDeviceComponentPS>
+) -> array<ref<DeviceComponentPS>> {
+  let networkDevices: array<ref<DeviceComponentPS>>;
+
+  // ScriptableDeviceComponentPS extends SharedGameplayPS
+  let sharedPS: ref<SharedGameplayPS> = targetDevice;
+  if !IsDefined(sharedPS) {
+    return networkDevices;
+  }
+
+  // Get all AccessPoints in network
+  let apControllers: array<ref<AccessPointControllerPS>> = sharedPS.GetAccessPoints();
+  if ArraySize(apControllers) == 0 {
+    return networkDevices;
+  }
+
+  // Collect devices from all AccessPoints
+  let i: Int32 = 0;
+  while i < ArraySize(apControllers) {
+    this.CollectAccessPointDevices(apControllers[i], i, networkDevices);
+    i += 1;
+  }
+
+  return networkDevices;
+}
+
+/*
+ * Collects all devices from a single AccessPoint. Helper method for network-wide
+ * device collection during breach processing.
+ *
+ * @param apPS AccessPoint persistent state
+ * @param apIndex Index of the AccessPoint in collection
+ * @param networkDevices Output array to append devices to
+ */
+@addMethod(PlayerPuppet)
+private func CollectAccessPointDevices(
+  apPS: ref<AccessPointControllerPS>,
+  apIndex: Int32,
+  out networkDevices: array<ref<DeviceComponentPS>>
+) -> Void {
+  if !IsDefined(apPS) {
+    return;
+  }
+
+  let apDevices: array<ref<DeviceComponentPS>>;
+  apPS.GetChildren(apDevices);
+
+  // Merge devices into main array
+  let j: Int32 = 0;
+  while j < ArraySize(apDevices) {
+    ArrayPush(networkDevices, apDevices[j]);
+    j += 1;
+  }
+}
+
+// ============================================================================
+// DEVICE UNLOCK LOGIC
+// ============================================================================
+
+// Apply unlock to RemoteBreach target device (with statistics)
+@addMethod(PlayerPuppet)
+private func ApplyRemoteBreachDeviceUnlockWithStats(
+  targetDevice: ref<ScriptableDeviceComponentPS>,
+  unlockFlags: BreachUnlockFlags,
+  stats: ref<BreachSessionStats>
+) -> Void {
+  // ScriptableDeviceComponentPS already extends SharedGameplayPS, no cast needed
+  if !IsDefined(targetDevice) {
+    BNError("[RemoteBreach]", "Target device is not defined, cannot unlock");
+    return;
+  }
+
+  // Use DeviceTypeUtils for centralized device type detection
+  let TargetType: TargetType = DeviceTypeUtils.GetDeviceType(targetDevice);
+
+  // Check if this device type should be unlocked based on flags
+  if !DeviceTypeUtils.ShouldUnlockByFlags(TargetType, unlockFlags) {
+    stats.devicesSkipped += 1;
+    return;
+  }
+
+  // Unlock quickhacks (reuse AccessPointControllerPS method via helper)
+  let dummyAPPS: ref<AccessPointControllerPS> = new AccessPointControllerPS();
+  dummyAPPS.QueuePSEvent(targetDevice, dummyAPPS.ActionSetExposeQuickHacks());
+
+  // Set breach timestamp
+  let currentTime: Float = TimeUtils.GetCurrentTimestamp(this.GetGame());
+  TimeUtils.SetDeviceUnlockTimestamp(targetDevice, TargetType, currentTime);
+
+  // Set breached subnet event (propagate unlock timestamps to device)
+  let setBreachedSubnetEvent: ref<SetBreachedSubnet> = new SetBreachedSubnet();
+  setBreachedSubnetEvent.unlockTimestampBasic = unlockFlags.unlockBasic ? currentTime : 0.0;
+  setBreachedSubnetEvent.unlockTimestampNPCs = unlockFlags.unlockNPCs ? currentTime : 0.0;
+  setBreachedSubnetEvent.unlockTimestampCameras = unlockFlags.unlockCameras ? currentTime : 0.0;
+  setBreachedSubnetEvent.unlockTimestampTurrets = unlockFlags.unlockTurrets ? currentTime : 0.0;
+  GameInstance.GetPersistencySystem(this.GetGame()).QueuePSEvent(targetDevice.GetID(), targetDevice.GetClassName(), setBreachedSubnetEvent);
+
+  // Update statistics
+  stats.devicesUnlocked += 1;
+  if Equals(TargetType, TargetType.Camera) {
+    stats.cameraCount += 1;
+  } else if Equals(TargetType, TargetType.Turret) {
+    stats.turretCount += 1;
+  } else if Equals(TargetType, TargetType.NPC) {
+    stats.npcNetworkCount += 1;
+  } else {
+    stats.basicCount += 1;
+  }
+}
+
+// ============================================================================
+// RADIAL UNLOCK INTEGRATION
+// ============================================================================
+
+// Record RemoteBreach position for Radial Unlock system (50m radius)
+@addMethod(PlayerPuppet)
+private func RecordRemoteBreachPosition(targetDevice: ref<ScriptableDeviceComponentPS>) -> Void {
+  let deviceEntity: wref<GameObject> = targetDevice.GetOwnerEntityWeak() as GameObject;
+
+  if !IsDefined(deviceEntity) {
+    BNWarn("[RemoteBreach]", "Target device entity not found, cannot record position");
+    return;
+  }
+
+  let devicePosition: Vector4 = deviceEntity.GetWorldPosition();
+
+  // Record position for Radial Unlock system (enables 50m radius unlock)
+  RecordAccessPointBreachByPosition(devicePosition, this.GetGame());
+}
+
+// ============================================================================
+// DEVICE SEARCH (TargetingSystem Integration)
+// ============================================================================
+
+/*
+ * Finds all devices within RadialBreach radius using TargetingSystem
+ *
+ * Visibility: Public (used by RemoteBreachLockSystem for Option C implementation)
+ *
+ * @param targetingSystem - TargetingSystem instance
+ * @return Mixed array (network + standalone devices)
+ */
+@addMethod(PlayerPuppet)
+public func FindNearbyDevices(
+  targetingSystem: ref<TargetingSystem>
+) -> array<ref<ScriptableDeviceComponentPS>> {
+  let devices: array<ref<ScriptableDeviceComponentPS>>;
+
+  // Setup device search query using DeviceUnlockUtils abstraction
+  let setup: TargetingSetup = DeviceUnlockUtils.SetupDeviceTargeting(this, this.GetGame());
+  if !setup.isValid {
+    return devices;
+  }
+
+  // Override query for device-specific search
+  setup.query.searchFilter = TSF_All(TSFMV.Obj_Device);
+
+  let parts: array<TS_TargetPartInfo>;
+  targetingSystem.GetTargetParts(this, setup.query, parts);
+
+  // Extract ScriptableDeviceComponentPS from target parts
+  let i: Int32 = 0;
+  while i < ArraySize(parts) {
+    let entity: wref<GameObject> = TS_TargetPartInfo.GetComponent(parts[i]).GetEntity() as GameObject;
+
+    if IsDefined(entity) {
+      let device: ref<Device> = entity as Device;
+      if IsDefined(device) {
+        let devicePS: ref<ScriptableDeviceComponentPS> = device.GetDevicePS();
+        if IsDefined(devicePS) {
+          ArrayPush(devices, devicePS);
+        }
+      }
+    }
+
+    i += 1;
+  }
+
+  return devices;
+}
+
+/*
+ * Finds all vehicles within RadialBreach radius using TargetingSystem
+ *
+ * RATIONALE: TSF_All(TSFMV.Obj_Device) excludes VehicleObject, requires no searchFilter
+ * Visibility: Public (used by RemoteBreachLockSystem for failure penalty)
+ *
+ * @param targetingSystem - TargetingSystem instance
+ * @return Array of VehicleComponentPS (extends ScriptableDeviceComponentPS)
+ */
+@addMethod(PlayerPuppet)
+public func FindNearbyVehicles(
+  targetingSystem: ref<TargetingSystem>
+) -> array<ref<VehicleComponentPS>> {
+  let vehicles: array<ref<VehicleComponentPS>>;
+
+  // Setup vehicle search query using DeviceUnlockUtils abstraction
+  let setup: TargetingSetup = DeviceUnlockUtils.SetupDeviceTargeting(this, this.GetGame());
+  if !setup.isValid {
+    return vehicles;
+  }
+
+  // No searchFilter for vehicle search (excludes devices, includes VehicleObject)
+  let parts: array<TS_TargetPartInfo>;
+  targetingSystem.GetTargetParts(this, setup.query, parts);
+
+  // Extract VehicleComponentPS from target parts
+  let i: Int32 = 0;
+  while i < ArraySize(parts) {
+    let entity: wref<GameObject> = TS_TargetPartInfo.GetComponent(parts[i]).GetEntity() as GameObject;
+
+    if IsDefined(entity) {
+      let vehicle: ref<VehicleObject> = entity as VehicleObject;
+      if IsDefined(vehicle) {
+        let vehiclePS: ref<VehicleComponentPS> = vehicle.GetVehiclePS();
+        if IsDefined(vehiclePS) {
+          ArrayPush(vehicles, vehiclePS);
+        }
+      }
+    }
+
+    i += 1;
+  }
+
+  return vehicles;
+}

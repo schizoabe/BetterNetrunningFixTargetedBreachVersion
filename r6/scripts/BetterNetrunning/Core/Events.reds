@@ -1,0 +1,231 @@
+// ============================================================================
+// BetterNetrunning - Common Event Definitions
+// ============================================================================
+//
+// PURPOSE:
+//   Defines custom events and persistent fields used across Better Netrunning modules
+//
+// FUNCTIONALITY:
+//   - SetBreachedSubnet event: Propagates breach state across network devices
+//   - Persistent fields: Timestamp-based breach state tracking
+//   - Direct breach tracking: Flags for NPC breach detection
+//
+// ARCHITECTURE:
+//   - Events: Custom events for cross-module communication
+//   - Persistent fields: @addField annotations for save game persistence
+//   - Timestamp system: 0.0 = never unlocked or expired
+//
+
+module BetterNetrunning.Core
+import BetterNetrunning.Core.TimeUtils
+import BetterNetrunningConfig.*
+
+// ============================================================================
+// Persistent Field Definitions
+// ============================================================================
+
+// Persistent field for tracking direct breach on NPCs
+@addField(ScriptedPuppetPS)
+public persistent let m_betterNetrunningWasDirectlyBreached: Bool;
+
+// ============================================================================
+// Unlock Timestamp Fields
+// ============================================================================
+// Tracks when each device type was last unlocked (for temporary unlock feature)
+// Value: Float timestamp from TimeSystem.GetGameTimeStamp()
+// 0.0 = never unlocked or expired
+
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningUnlockTimestampBasic: Float;
+
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningUnlockTimestampCameras: Float;
+
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningUnlockTimestampTurrets: Float;
+
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningUnlockTimestampNPCs: Float;
+
+// ============================================================================
+// Breach Failure Penalty Timestamps
+// ============================================================================
+// Records breach failure timestamps for penalty system (10 minutes lock duration)
+// Value: Float timestamp from TimeSystem.GetGameTimeStamp()
+// 0.0 = never failed or penalty expired
+
+// AP Breach failure penalty timestamp (device-side persistent for save/load compatibility)
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningAPBreachFailedTimestamp: Float;
+
+// NPC Breach failure penalty timestamp (NPC-side persistent for save/load compatibility)
+@addField(ScriptedPuppetPS)
+public persistent let m_betterNetrunningNPCBreachFailedTimestamp: Float;
+
+// RemoteBreach failure penalty timestamp (device-side persistent for save/load compatibility)
+@addField(SharedGameplayPS)
+public persistent let m_betterNetrunningRemoteBreachFailedTimestamp: Float;
+
+// ============================================================================
+// Breach State Event System
+// ============================================================================
+
+/*
+ * Custom event for propagating breach state across network devices
+ * Sent to all devices when subnet is successfully breached
+ * Uses timestamp-based state management (0.0 = unlocked expired or never breached)
+ */
+public class SetBreachedSubnet extends ActionBool {
+
+  public let unlockTimestampBasic: Float;
+  public let unlockTimestampNPCs: Float;
+  public let unlockTimestampCameras: Float;
+  public let unlockTimestampTurrets: Float;
+
+  public final func SetProperties() -> Void {
+    this.actionName = BNConstants.ACTION_SET_BREACHED_SUBNET();
+    this.prop = DeviceActionPropertyFunctions.SetUpProperty_Bool(this.actionName, true, BNConstants.ACTION_SET_BREACHED_SUBNET(), BNConstants.ACTION_SET_BREACHED_SUBNET());
+  }
+
+  public func GetTweakDBChoiceRecord() -> String {
+    return NameToString(BNConstants.ACTION_SET_BREACHED_SUBNET());
+  }
+
+  public final static func IsAvailable(device: ref<ScriptableDeviceComponentPS>) -> Bool {
+    return true;
+  }
+
+  public final static func IsClearanceValid(clearance: ref<Clearance>) -> Bool {
+    if Clearance.IsInRange(clearance, 2) {
+      return true;
+    };
+    return false;
+  }
+
+  public final static func IsContextValid(const context: script_ref<GetActionsContext>) -> Bool {
+    if Equals(Deref(context).requestType, gamedeviceRequestType.Direct) {
+      return true;
+    };
+    return false;
+  }
+
+}
+
+// Event handler: Updates device breach state when subnet is breached
+@addMethod(SharedGameplayPS)
+public func OnSetBreachedSubnet(evt: ref<SetBreachedSubnet>) -> EntityNotificationType {
+  // Timestamp-based state management
+  // 0.0 = unlocked expired or never breached
+  // > 0.0 = breached at specific game time
+
+  this.m_betterNetrunningUnlockTimestampBasic = evt.unlockTimestampBasic;
+  this.m_betterNetrunningUnlockTimestampNPCs = evt.unlockTimestampNPCs;
+  this.m_betterNetrunningUnlockTimestampCameras = evt.unlockTimestampCameras;
+  this.m_betterNetrunningUnlockTimestampTurrets = evt.unlockTimestampTurrets;
+
+  return EntityNotificationType.DoNotNotifyEntity;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// ============================================================================
+// Breach Status Utilities
+// ============================================================================
+
+/*
+ * Checks if a device type is breached based on unlock timestamp
+ * Unified breach status check - replaces redundant m_betterNetrunningBreached* flags
+ *
+ * @param unlockTimestamp - The unlock timestamp (0.0 = not breached)
+ * @return True if breached (timestamp > 0.0), False otherwise
+ */
+public abstract class BreachStatusUtils {
+
+  public static func IsBreached(unlockTimestamp: Float) -> Bool {
+    return unlockTimestamp > 0.0;
+  }
+
+  /**
+   * Check if device is breached AND unlock duration has not expired
+   *
+   * @param unlockTimestamp - The unlock timestamp (0.0 = not breached)
+   * @param gameInstance - Game instance for time retrieval
+   * @return True if breached and not expired, False otherwise
+   */
+  public static func IsBreachedWithExpiration(unlockTimestamp: Float, gameInstance: GameInstance) -> Bool {
+    // Not breached
+    if unlockTimestamp <= 0.0 {
+      return false;
+    }
+
+    // Check expiration
+    let unlockDurationHours: Int32 = BetterNetrunningSettings.QuickhackUnlockDurationHours();
+
+    // Permanent unlock (duration = 0)
+    if unlockDurationHours <= 0 {
+      return true;
+    }
+
+    // Temporary unlock - check expiration
+    let currentTime: Float = TimeUtils.GetCurrentTimestamp(gameInstance);
+    let elapsedTime: Float = currentTime - unlockTimestamp;
+    let durationSeconds: Float = Cast<Float>(unlockDurationHours) * 3600.0;
+
+    let isStillValid: Bool = elapsedTime <= durationSeconds;
+
+    return isStillValid;
+  }
+
+  // Convenience methods for SharedGameplayPS
+  public static func IsBasicBreached(sharedPS: ref<SharedGameplayPS>) -> Bool {
+    return BreachStatusUtils.IsBreached(sharedPS.m_betterNetrunningUnlockTimestampBasic);
+  }
+
+  public static func IsNPCsBreached(sharedPS: ref<SharedGameplayPS>) -> Bool {
+    return BreachStatusUtils.IsBreached(sharedPS.m_betterNetrunningUnlockTimestampNPCs);
+  }
+
+  public static func IsCamerasBreached(sharedPS: ref<SharedGameplayPS>) -> Bool {
+    return BreachStatusUtils.IsBreached(sharedPS.m_betterNetrunningUnlockTimestampCameras);
+  }
+
+  public static func IsTurretsBreached(sharedPS: ref<SharedGameplayPS>) -> Bool {
+    return BreachStatusUtils.IsBreached(sharedPS.m_betterNetrunningUnlockTimestampTurrets);
+  }
+}
+
+/*
+ * IsCustomRemoteBreachAction() - Convenience wrapper for DeviceAction type checking.
+ *
+ * Checks if DeviceAction is a CustomRemoteBreach action without manual GetClassName() calls.
+ * Includes null safety check.
+ *
+ * Supported action types (only when HackingExtensions MOD installed):
+ * - RemoteBreachAction (Computer breach)
+ * - DeviceRemoteBreachAction (generic device)
+ * - VehicleRemoteBreachAction (vehicle breach)
+ *
+ * @param action Device action to check
+ * @return True if action is CustomRemoteBreach, false if undefined or other type
+ */
+public func IsCustomRemoteBreachAction(action: ref<DeviceAction>) -> Bool {
+  if !IsDefined(action) {
+    return false;
+  }
+  return BNConstants.IsRemoteBreachAction(action.GetClassName());
+}
+
+/*
+ * IsCustomRemoteBreachAction() - CName overload for pre-extracted class names.
+ *
+ * Optimized variant when className is already available (avoids redundant GetClassName() call).
+ *
+ * @param className Class name to check
+ * @return True if className matches CustomRemoteBreach action types
+ */
+public func IsCustomRemoteBreachAction(className: CName) -> Bool {
+  return BNConstants.IsRemoteBreachAction(className);
+}
+
